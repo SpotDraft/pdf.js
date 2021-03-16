@@ -122,6 +122,8 @@ class AnnotationFactory {
             return new ButtonWidgetAnnotation(parameters);
           case "Ch":
             return new ChoiceWidgetAnnotation(parameters);
+          case "Sig":
+            return new SquareAnnotation(parameters);
         }
         warn(
           'Unimplemented widget field type "' +
@@ -1051,11 +1053,13 @@ class WidgetAnnotation extends Annotation {
     // Hide signatures because we cannot validate them, and unset the fieldValue
     // since it's (most likely) a `Dict` which is non-serializable and will thus
     // cause errors when sending annotations to the main-thread (issue 10347).
-    if (data.fieldType === "Sig") {
-      data.fieldValue = null;
-      this.setFlags(AnnotationFlag.HIDDEN);
-      data.hidden = true;
-    }
+    // CUSTOMISATION: Until https://github.com/mozilla/pdf.js/issues/1076 is resolved, 
+    // we will render the signature but not verify it.
+    // if (data.fieldType === "Sig") {
+    //   data.fieldValue = null;
+    //   this.setFlags(AnnotationFlag.HIDDEN);
+    //   data.hidden = true;
+    // }
   }
 
   /**
