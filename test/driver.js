@@ -392,6 +392,20 @@ var Driver = (function DriverClosure() {
         task.pageNum = task.firstPage || 1;
         task.stats = { times: [] };
 
+        // Support *linked* test-cases for the other suites, e.g. unit- and
+        // integration-tests, without needing to run them as reference-tests.
+        if (task.type === "other") {
+          this._log(`Skipping file "${task.file}"\n`);
+
+          if (!task.link) {
+            this._nextPage(task, 'Expected "other" test-case to be linked.');
+            return;
+          }
+          this.currentTask++;
+          this._nextTask();
+          return;
+        }
+
         this._log('Loading file "' + task.file + '"\n');
 
         const absoluteUrl = new URL(task.file, window.location).href;
@@ -558,6 +572,7 @@ var Driver = (function DriverClosure() {
                 initPromise = page
                   .getTextContent({
                     normalizeWhitespace: true,
+                    includeMarkedContent: true,
                   })
                   .then(function (textContent) {
                     return rasterizeTextLayer(
@@ -621,14 +636,13 @@ var Driver = (function DriverClosure() {
                 optionalContentConfigPromise: task.optionalContentConfigPromise,
               };
               if (renderPrint) {
-                const annotationStorage = task.annotationStorage;
-                if (annotationStorage) {
-                  const docAnnotationStorage = task.pdfDoc.annotationStorage;
-                  const entries = Object.entries(annotationStorage);
+                if (task.annotationStorage) {
+                  const entries = Object.entries(task.annotationStorage),
+                    docAnnotationStorage = task.pdfDoc.annotationStorage;
                   for (const [key, value] of entries) {
                     docAnnotationStorage.setValue(key, value);
                   }
-                  renderContext.annotationStorage = docAnnotationStorage;
+                  renderContext.includeAnnotationStorage = true;
                 }
                 renderContext.intent = "print";
               }

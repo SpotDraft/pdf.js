@@ -1554,6 +1554,8 @@ var Font = (function FontClosure() {
 
       function readTrueTypeCollectionData(ttc, fontName) {
         const { numFonts, offsetTable } = readTrueTypeCollectionHeader(ttc);
+        const fontNameParts = fontName.split("+");
+        let fallbackData;
 
         for (let i = 0; i < numFonts; i++) {
           ttc.pos = (ttc.start || 0) + offsetTable[i];
@@ -1569,15 +1571,41 @@ var Font = (function FontClosure() {
 
           for (let j = 0, jj = nameTable.length; j < jj; j++) {
             for (let k = 0, kk = nameTable[j].length; k < kk; k++) {
-              const nameEntry = nameTable[j][k];
-              if (nameEntry && nameEntry.replace(/\s/g, "") === fontName) {
+              const nameEntry =
+                nameTable[j][k] && nameTable[j][k].replace(/\s/g, "");
+              if (!nameEntry) {
+                continue;
+              }
+              if (nameEntry === fontName) {
                 return {
                   header: potentialHeader,
                   tables: potentialTables,
                 };
               }
+              if (fontNameParts.length < 2) {
+                continue;
+              }
+              for (const part of fontNameParts) {
+                if (nameEntry === part) {
+                  fallbackData = {
+                    name: part,
+                    header: potentialHeader,
+                    tables: potentialTables,
+                  };
+                }
+              }
             }
           }
+        }
+        if (fallbackData) {
+          warn(
+            `TrueType Collection does not contain "${fontName}" font, ` +
+              `falling back to "${fallbackData.name}" font instead.`
+          );
+          return {
+            header: fallbackData.header,
+            tables: fallbackData.tables,
+          };
         }
         throw new FormatError(
           `TrueType Collection does not contain "${fontName}" font.`
@@ -2901,14 +2929,21 @@ var Font = (function FontClosure() {
         }
 
         // Last, try to map any missing charcodes using the post table.
-        if (properties.glyphNames && baseEncoding.length) {
+        if (
+          properties.glyphNames &&
+          (baseEncoding.length || this.differences.length)
+        ) {
           for (let i = 0; i < 256; ++i) {
-            if (charCodeToGlyphId[i] === undefined && baseEncoding[i]) {
-              glyphName = baseEncoding[i];
-              const glyphId = properties.glyphNames.indexOf(glyphName);
-              if (glyphId > 0 && hasGlyph(glyphId)) {
-                charCodeToGlyphId[i] = glyphId;
-              }
+            if (charCodeToGlyphId[i] !== undefined) {
+              continue;
+            }
+            glyphName = this.differences[i] || baseEncoding[i];
+            if (!glyphName) {
+              continue;
+            }
+            const glyphId = properties.glyphNames.indexOf(glyphName);
+            if (glyphId > 0 && hasGlyph(glyphId)) {
+              charCodeToGlyphId[i] = glyphId;
             }
           }
         }

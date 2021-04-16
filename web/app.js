@@ -22,7 +22,6 @@ import {
   DEFAULT_SCALE_VALUE,
   EventBus,
   getActiveOrFocusedElement,
-  getPDFFileNameFromURL,
   isValidRotation,
   isValidScrollMode,
   isValidSpreadMode,
@@ -44,6 +43,7 @@ import {
   createPromiseCapability,
   getDocument,
   getFilenameFromUrl,
+  getPdfFilenameFromUrl,
   GlobalWorkerOptions,
   InvalidPDFException,
   isPdfFile,
@@ -198,7 +198,7 @@ class DefaultExternalServices {
 const PDFViewerApplication = {
   initialBookmark: document.location.hash.substring(1),
   _initializedCapability: createPromiseCapability(),
-  fellback: false,
+  _fellback: false,
   appConfig: null,
   pdfDocument: null,
   pdfLoadingTask: null,
@@ -465,7 +465,7 @@ const PDFViewerApplication = {
     this.overlayManager = new OverlayManager();
 
     const pdfRenderingQueue = new PDFRenderingQueue();
-    pdfRenderingQueue.onIdle = this.cleanup.bind(this);
+    pdfRenderingQueue.onIdle = this._cleanup.bind(this);
     this.pdfRenderingQueue = pdfRenderingQueue;
 
     const pdfLinkService = new PDFLinkService({
@@ -748,7 +748,7 @@ const PDFViewerApplication = {
   setTitleUsingUrl(url = "") {
     this.url = url;
     this.baseUrl = url.split("#")[0];
-    let title = getPDFFileNameFromURL(url, "");
+    let title = getPdfFilenameFromUrl(url, "");
     if (!title) {
       try {
         title = decodeURIComponent(getFilenameFromUrl(url)) || url;
@@ -772,7 +772,7 @@ const PDFViewerApplication = {
   get _docFilename() {
     // Use `this.url` instead of `this.baseUrl` to perform filename detection
     // based on the reference fragment as ultimate fallback if needed.
-    return this._contentDispositionFilename || getPDFFileNameFromURL(this.url);
+    return this._contentDispositionFilename || getPdfFilenameFromUrl(this.url);
   },
 
   /**
@@ -802,7 +802,19 @@ const PDFViewerApplication = {
     }
 
     if (!this.pdfLoadingTask) {
-      return undefined;
+      return;
+    }
+    if (
+      (typeof PDFJSDev === "undefined" || PDFJSDev.test("GENERIC")) &&
+      this.pdfDocument?.annotationStorage.size > 0 &&
+      this._annotationStorageModified
+    ) {
+      try {
+        // Trigger saving, to prevent data loss in forms; see issue 12257.
+        await this.save({ sourceEventType: "save" });
+      } catch (reason) {
+        // Ignoring errors, to ensure that document closing won't break.
+      }
     }
     const promises = [];
 
@@ -818,6 +830,7 @@ const PDFViewerApplication = {
       this.pdfDocumentProperties.setDocument(null);
     }
     webViewerResetPermissions();
+    this._fellback = false;
     this.store = null;
     this.isInitialViewSet = false;
     this.downloadComplete = false;
@@ -851,8 +864,6 @@ const PDFViewerApplication = {
       PDFBug.cleanup();
     }
     await Promise.all(promises);
-
-    return undefined;
   },
 
   /**
@@ -949,62 +960,57 @@ const PDFViewerApplication = {
     );
   },
 
-  download({ sourceEventType = "download" } = {}) {
-    function downloadByUrl() {
-      downloadManager.downloadUrl(url, filename);
-    }
-
-    const downloadManager = this.downloadManager,
-      url = this.baseUrl,
-      filename = this._docFilename;
-
-    // When the PDF document isn't ready, or the PDF file is still downloading,
-    // simply download using the URL.
-    if (!this.pdfDocument || !this.downloadComplete) {
-      downloadByUrl();
+  /**
+   * @private
+   */
+  _ensureDownloadComplete() {
+    if (this.pdfDocument && this.downloadComplete) {
       return;
     }
+    throw new Error("PDF document not downloaded.");
+  },
 
-    this.pdfDocument
-      .getData()
-      .then(function (data) {
-        const blob = new Blob([data], { type: "application/pdf" });
-        downloadManager.download(blob, url, filename, sourceEventType);
-      })
-      .catch(downloadByUrl); // Error occurred, try downloading with the URL.
+  async download({ sourceEventType = "download" } = {}) {
+    const url = this.baseUrl,
+      filename = this._docFilename;
+    try {
+      this._ensureDownloadComplete();
+
+      const data = await this.pdfDocument.getData();
+      const blob = new Blob([data], { type: "application/pdf" });
+
+      await this.downloadManager.download(blob, url, filename, sourceEventType);
+    } catch (reason) {
+      // When the PDF document isn't ready, or the PDF file is still
+      // downloading, simply download using the URL.
+      await this.downloadManager.downloadUrl(url, filename);
+    }
   },
 
   async save({ sourceEventType = "download" } = {}) {
     if (this._saveInProgress) {
       return;
     }
-
-    const downloadManager = this.downloadManager,
-      url = this.baseUrl,
-      filename = this._docFilename;
-
-    // When the PDF document isn't ready, or the PDF file is still downloading,
-    // simply download using the URL.
-    if (!this.pdfDocument || !this.downloadComplete) {
-      this.download({ sourceEventType });
-      return;
-    }
     this._saveInProgress = true;
     await this.pdfScriptingManager.dispatchWillSave();
 
-    this.pdfDocument
-      .saveDocument(this.pdfDocument.annotationStorage)
-      .then(data => {
-        const blob = new Blob([data], { type: "application/pdf" });
-        downloadManager.download(blob, url, filename, sourceEventType);
-      })
-      .catch(() => {
-        this.download({ sourceEventType });
-      })
-      .finally(async () => {
-        await this.pdfScriptingManager.dispatchDidSave();
-        this._saveInProgress = false;
-      });
+    const url = this.baseUrl,
+      filename = this._docFilename;
+    try {
+      this._ensureDownloadComplete();
+
+      const data = await this.pdfDocument.saveDocument();
+      const blob = new Blob([data], { type: "application/pdf" });
+
+      await this.downloadManager.download(blob, url, filename, sourceEventType);
+    } catch (reason) {
+      // When the PDF document isn't ready, or the PDF file is still
+      // downloading, simply fallback to a "regular" download.
+      await this.download({ sourceEventType });
+    } finally {
+      await this.pdfScriptingManager.dispatchDidSave();
+      this._saveInProgress = false;
+    }
   },
 
   downloadOrSave(options) {
@@ -1051,10 +1057,21 @@ const PDFViewerApplication = {
     }
     // Only trigger the fallback once so we don't spam the user with messages
     // for one PDF.
-    if (this.fellback) {
+    if (this._fellback) {
       return;
     }
-    this.fellback = true;
+    this._fellback = true;
+
+    // Ensure that, for signatures, a warning is shown in non-Firefox builds.
+    if (
+      (typeof PDFJSDev === "undefined" || !PDFJSDev.test("MOZCENTRAL")) &&
+      featureId === UNSUPPORTED_FEATURES.signatures
+    ) {
+      this.l10n.get("unsupported_feature_signatures").then(msg => {
+        this._otherError(msg);
+      });
+    }
+
     this.externalServices
       .fallback({
         featureId,
@@ -1378,14 +1395,23 @@ const PDFViewerApplication = {
 
     onePageRendered.then(() => {
       pdfDocument.getOutline().then(outline => {
+        if (pdfDocument !== this.pdfDocument) {
+          return; // The document was closed while the outline resolved.
+        }
         this.pdfOutlineViewer.render({ outline, pdfDocument });
       });
       pdfDocument.getAttachments().then(attachments => {
+        if (pdfDocument !== this.pdfDocument) {
+          return; // The document was closed while the attachments resolved.
+        }
         this.pdfAttachmentViewer.render({ attachments });
       });
       // Ensure that the layers accurately reflects the current state in the
       // viewer itself, rather than the default state provided by the API.
       pdfViewer.optionalContentConfigPromise.then(optionalContentConfig => {
+        if (pdfDocument !== this.pdfDocument) {
+          return; // The document was closed while the layers resolved.
+        }
         this.pdfLayerViewer.render({ optionalContentConfig, pdfDocument });
       });
       if (
@@ -1560,7 +1586,12 @@ const PDFViewerApplication = {
       this.setTitle(contentDispositionFilename);
     }
 
-    if (info.IsXFAPresent && !info.IsAcroFormPresent) {
+    if (
+      info.IsXFAPresent &&
+      !info.IsAcroFormPresent &&
+      // Note: `isPureXfa === true` implies that `enableXfa = true` was set.
+      !pdfDocument.isPureXfa
+    ) {
       console.warn("Warning: XFA is not supported");
       this._delayedFallback(UNSUPPORTED_FEATURES.forms);
     } else if (
@@ -1569,6 +1600,11 @@ const PDFViewerApplication = {
     ) {
       console.warn("Warning: Interactive form support is not enabled");
       this._delayedFallback(UNSUPPORTED_FEATURES.forms);
+    }
+
+    if (info.IsSignaturesPresent) {
+      console.warn("Warning: Digital signatures validation is not supported");
+      this.fallback(UNSUPPORTED_FEATURES.signatures);
     }
 
     // Telemetry labels must be C++ variable friendly.
@@ -1705,11 +1741,19 @@ const PDFViewerApplication = {
     }
     const { annotationStorage } = pdfDocument;
 
-    annotationStorage.onSetModified = function () {
+    annotationStorage.onSetModified = () => {
       window.addEventListener("beforeunload", beforeUnload);
+
+      if (typeof PDFJSDev === "undefined" || PDFJSDev.test("GENERIC")) {
+        this._annotationStorageModified = true;
+      }
     };
-    annotationStorage.onResetModified = function () {
+    annotationStorage.onResetModified = () => {
       window.removeEventListener("beforeunload", beforeUnload);
+
+      if (typeof PDFJSDev === "undefined" || PDFJSDev.test("GENERIC")) {
+        delete this._annotationStorageModified;
+      }
     };
   },
 
@@ -1762,7 +1806,10 @@ const PDFViewerApplication = {
     }
   },
 
-  cleanup() {
+  /**
+   * @private
+   */
+  _cleanup() {
     if (!this.pdfDocument) {
       return; // run cleanup when document is loaded
     }
@@ -1770,9 +1817,9 @@ const PDFViewerApplication = {
     this.pdfThumbnailViewer.cleanup();
 
     // We don't want to remove fonts used by active page SVGs.
-    if (this.pdfViewer.renderer !== RendererType.SVG) {
-      this.pdfDocument.cleanup();
-    }
+    this.pdfDocument.cleanup(
+      /* keepLoadedFonts = */ this.pdfViewer.renderer === RendererType.SVG
+    );
   },
 
   forceRendering() {
@@ -1851,11 +1898,7 @@ const PDFViewerApplication = {
   },
 
   rotatePages(delta) {
-    if (!this.pdfDocument) {
-      return;
-    }
-    const newRotation = (this.pdfViewer.pagesRotation + 360 + delta) % 360;
-    this.pdfViewer.pagesRotation = newRotation;
+    this.pdfViewer.pagesRotation += delta;
     // Note that the thumbnail viewer is updated, and rendering is triggered,
     // in the 'rotationchanging' event handler.
   },
@@ -2273,39 +2316,19 @@ function webViewerInitialized() {
   }
 }
 
-let webViewerOpenFileViaURL;
-if (typeof PDFJSDev === "undefined" || PDFJSDev.test("GENERIC")) {
-  webViewerOpenFileViaURL = function (file) {
-    if (file && file.lastIndexOf("file:", 0) === 0) {
-      // file:-scheme. Load the contents in the main thread because QtWebKit
-      // cannot load file:-URLs in a Web Worker. file:-URLs are usually loaded
-      // very quickly, so there is no need to set up progress event listeners.
-      PDFViewerApplication.setTitleUsingUrl(file);
-      const xhr = new XMLHttpRequest();
-      xhr.onload = function () {
-        PDFViewerApplication.open(new Uint8Array(xhr.response));
-      };
-      xhr.open("GET", file);
-      xhr.responseType = "arraybuffer";
-      xhr.send();
-      return;
-    }
-
+function webViewerOpenFileViaURL(file) {
+  if (typeof PDFJSDev === "undefined" || PDFJSDev.test("GENERIC")) {
     if (file) {
       PDFViewerApplication.open(file);
     }
-  };
-} else if (PDFJSDev.test("MOZCENTRAL || CHROME")) {
-  webViewerOpenFileViaURL = function (file) {
+  } else if (PDFJSDev.test("MOZCENTRAL || CHROME")) {
     PDFViewerApplication.setTitleUsingUrl(file);
     PDFViewerApplication.initPassiveLoading();
-  };
-} else {
-  webViewerOpenFileViaURL = function (file) {
+  } else {
     if (file) {
       throw new Error("Not implemented: webViewerOpenFileViaURL");
     }
-  };
+  }
 }
 
 function webViewerResetPermissions() {

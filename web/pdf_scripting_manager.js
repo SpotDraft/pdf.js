@@ -128,6 +128,11 @@ class PDFScriptingManager {
     this._internalEvents.set("pagesdestroy", async event => {
       await this._dispatchPageClose(this._pdfViewer.currentPageNumber);
 
+      await this._scripting?.dispatchEventInSandbox({
+        id: "doc",
+        name: "WillClose",
+      });
+
       this._closeCapability?.resolve();
     });
 
@@ -260,7 +265,12 @@ class PDFScriptingManager {
   /**
    * @private
    */
-  _updateFromSandbox(detail) {
+  async _updateFromSandbox(detail) {
+    // Ignore some events, see below, that don't make sense in PresentationMode.
+    const isInPresentationMode =
+      this._pdfViewer.isInPresentationMode ||
+      this._pdfViewer.isChangingPresentationMode;
+
     const { id, command, value } = detail;
     if (!id) {
       switch (command) {
@@ -277,28 +287,35 @@ class PDFScriptingManager {
           this._pdfViewer.currentPageNumber = value + 1;
           break;
         case "print":
-          this._pdfViewer.pagesPromise.then(() => {
-            this._eventBus.dispatch("print", { source: this });
-          });
+          await this._pdfViewer.pagesPromise;
+          this._eventBus.dispatch("print", { source: this });
           break;
         case "println":
           console.log(value);
           break;
         case "zoom":
+          if (isInPresentationMode) {
+            return;
+          }
           this._pdfViewer.currentScaleValue = value;
           break;
       }
       return;
     }
 
+    if (isInPresentationMode) {
+      if (detail.focus) {
+        return;
+      }
+    }
+
     const element = document.getElementById(id);
     if (element) {
       element.dispatchEvent(new CustomEvent("updatefromsandbox", { detail }));
     } else {
-      if (value !== undefined && value !== null) {
-        // The element hasn't been rendered yet, use the AnnotationStorage.
-        this._pdfDocument?.annotationStorage.setValue(id, value);
-      }
+      delete detail.id;
+      // The element hasn't been rendered yet, use the AnnotationStorage.
+      this._pdfDocument?.annotationStorage.setValue(id, detail);
     }
   }
 
@@ -383,11 +400,9 @@ class PDFScriptingManager {
    * @private
    */
   async _getDocProperties() {
-    // The default viewer use-case.
     if (this._docPropertiesLookup) {
       return this._docPropertiesLookup(this._pdfDocument);
     }
-    // Fallback, to support the viewer components use-case.
     if (typeof PDFJSDev !== "undefined" && PDFJSDev.test("COMPONENTS")) {
       const { docPropertiesLookup } = require("./generic_scripting.js");
 

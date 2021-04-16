@@ -48,6 +48,8 @@ import { viewerCompatibilityParams } from "./viewer_compatibility.js";
  *   behaviour is enabled. The constants from {TextLayerMode} should be used.
  *   The default value is `TextLayerMode.ENABLE`.
  * @property {IPDFAnnotationLayerFactory} annotationLayerFactory
+ * @property {IPDFXfaLayerFactory} xfaLayerFactory
+ * @property {IPDFStructTreeLayerFactory} structTreeLayerFactory
  * @property {string} [imageResourcesPath] - Path for image resources, mainly
  *   for annotation icons. Include trailing slash.
  * @property {boolean} renderInteractiveForms - Turns on rendering of
@@ -61,8 +63,6 @@ import { viewerCompatibilityParams } from "./viewer_compatibility.js";
  *   total pixels, i.e. width * height. Use -1 for no limit. The default value
  *   is 4096 * 4096 (16 mega-pixels).
  * @property {IL10n} l10n - Localization service.
- * @property {boolean} [enableScripting] - Enable embedded script execution.
- *   The default value is `false`.
  */
 
 const MAX_CANVAS_PIXELS = viewerCompatibilityParams.maxCanvasPixels || 16777216;
@@ -102,10 +102,11 @@ class PDFPageView {
     this.renderingQueue = options.renderingQueue;
     this.textLayerFactory = options.textLayerFactory;
     this.annotationLayerFactory = options.annotationLayerFactory;
+    this.xfaLayerFactory = options.xfaLayerFactory;
+    this.structTreeLayerFactory = options.structTreeLayerFactory;
     this.renderer = options.renderer || RendererType.CANVAS;
     this.enableWebGL = options.enableWebGL || false;
     this.l10n = options.l10n || NullL10n;
-    this.enableScripting = options.enableScripting === true;
 
     this.paintTask = null;
     this.paintedViewportMap = new WeakMap();
@@ -116,12 +117,18 @@ class PDFPageView {
     this.annotationLayer = null;
     this.textLayer = null;
     this.zoomLayer = null;
+    this.xfaLayer = null;
+    this.structTreeLayer = null;
 
     const div = document.createElement("div");
     div.className = "page";
     div.style.width = Math.floor(this.viewport.width) + "px";
     div.style.height = Math.floor(this.viewport.height) + "px";
     div.setAttribute("data-page-number", this.id);
+    div.setAttribute("role", "region");
+    this.l10n.get("page_landmark", { page: this.id }).then(msg => {
+      div.setAttribute("aria-label", msg);
+    });
     this.div = div;
 
     container.appendChild(div);
@@ -167,6 +174,24 @@ class PDFPageView {
   /**
    * @private
    */
+  async _renderXfaLayer() {
+    let error = null;
+    try {
+      await this.xfaLayer.render(this.viewport, "display");
+    } catch (ex) {
+      error = ex;
+    } finally {
+      this.eventBus.dispatch("xfalayerrendered", {
+        source: this,
+        pageNumber: this.id,
+        error,
+      });
+    }
+  }
+
+  /**
+   * @private
+   */
   _resetZoomLayer(removeFromDOM = false) {
     if (!this.zoomLayer) {
       return;
@@ -197,9 +222,14 @@ class PDFPageView {
     const currentZoomLayerNode = (keepZoomLayer && this.zoomLayer) || null;
     const currentAnnotationNode =
       (keepAnnotations && this.annotationLayer?.div) || null;
+    const currentXfaLayerNode = this.xfaLayer?.div || null;
     for (let i = childNodes.length - 1; i >= 0; i--) {
       const node = childNodes[i];
-      if (currentZoomLayerNode === node || currentAnnotationNode === node) {
+      if (
+        currentZoomLayerNode === node ||
+        currentAnnotationNode === node ||
+        currentXfaLayerNode === node
+      ) {
         continue;
       }
       div.removeChild(node);
@@ -233,6 +263,10 @@ class PDFPageView {
 
     this.loadingIconDiv = document.createElement("div");
     this.loadingIconDiv.className = "loadingIcon";
+    this.loadingIconDiv.setAttribute("role", "img");
+    this.l10n.get("loading").then(msg => {
+      this.loadingIconDiv?.setAttribute("aria-label", msg);
+    });
     div.appendChild(this.loadingIconDiv);
   }
 
@@ -323,6 +357,10 @@ class PDFPageView {
       this.annotationLayer.cancel();
       this.annotationLayer = null;
     }
+    if (this._onTextLayerRendered) {
+      this.eventBus._off("textlayerrendered", this._onTextLayerRendered);
+      this._onTextLayerRendered = null;
+    }
   }
 
   cssTransform(target, redrawAnnotations = false) {
@@ -392,6 +430,10 @@ class PDFPageView {
 
     if (redrawAnnotations && this.annotationLayer) {
       this._renderAnnotationLayer();
+    }
+
+    if (this.xfaLayer) {
+      this._renderXfaLayer();
     }
   }
 
@@ -521,11 +563,12 @@ class PDFPageView {
     this.paintTask = paintTask;
 
     const resultPromise = paintTask.promise.then(
-      function () {
-        return finishPaintTask(null).then(function () {
+      () => {
+        return finishPaintTask(null).then(() => {
           if (textLayer) {
             const readableStream = pdfPage.streamTextContent({
               normalizeWhitespace: true,
+              includeMarkedContent: true,
             });
             textLayer.setTextContentStream(readableStream);
             textLayer.render();
@@ -546,13 +589,50 @@ class PDFPageView {
           this.imageResourcesPath,
           this.renderInteractiveForms,
           this.l10n,
-          this.enableScripting,
+          /* enableScripting */ null,
           /* hasJSActionsPromise = */ null,
           /* mouseState = */ null
         );
       }
       this._renderAnnotationLayer();
     }
+
+    if (this.xfaLayerFactory) {
+      if (!this.xfaLayer) {
+        this.xfaLayer = this.xfaLayerFactory.createXfaLayerBuilder(
+          div,
+          pdfPage
+        );
+      }
+      this._renderXfaLayer();
+    }
+
+    // The structure tree is currently only supported when the text layer is
+    // enabled and a canvas is used for rendering.
+    if (this.structTreeLayerFactory && this.textLayer && this.canvas) {
+      // The structure tree must be generated after the text layer for the
+      // aria-owns to work.
+      this._onTextLayerRendered = event => {
+        if (event.pageNumber !== this.id) {
+          return;
+        }
+        this.eventBus._off("textlayerrendered", this._onTextLayerRendered);
+        this._onTextLayerRendered = null;
+        this.pdfPage.getStructTree().then(tree => {
+          if (!tree) {
+            return;
+          }
+          const treeDom = this.structTreeLayer.render(tree);
+          treeDom.classList.add("structTree");
+          this.canvas.appendChild(treeDom);
+        });
+      };
+      this.eventBus._on("textlayerrendered", this._onTextLayerRendered);
+      this.structTreeLayer = this.structTreeLayerFactory.createStructTreeLayerBuilder(
+        pdfPage
+      );
+    }
+
     div.setAttribute("data-loaded", true);
 
     this.eventBus.dispatch("pagerender", {
@@ -576,9 +656,6 @@ class PDFPageView {
 
     const viewport = this.viewport;
     const canvas = document.createElement("canvas");
-    this.l10n.get("page_canvas", { page: this.id }).then(msg => {
-      canvas.setAttribute("aria-label", msg);
-    });
 
     // Keep the canvas hidden until the first draw callback, or until drawing
     // is complete when `!this.renderingQueue`, to prevent black flickering.
