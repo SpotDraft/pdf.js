@@ -636,9 +636,11 @@ class TextWidgetAnnotationElement extends WidgetAnnotationElement {
       // NOTE: We cannot set the values using `element.value` below, since it
       //       prevents the AnnotationLayer rasterizer in `test/driver.js`
       //       from parsing the elements correctly for the reference tests.
-      const textContent = storage.getValue(id, {
+      const storedData = storage.getValue(id, {
         value: this.data.fieldValue,
-      }).value;
+        valueAsString: this.data.fieldValue,
+      });
+      const textContent = storedData.valueAsString || storedData.value || "";
       const elementData = {
         userValue: null,
         formattedValue: null,
@@ -666,7 +668,8 @@ class TextWidgetAnnotationElement extends WidgetAnnotationElement {
         if (elementData.formattedValue) {
           event.target.value = elementData.formattedValue;
         }
-        event.target.setSelectionRange(0, 0);
+        // Reset the cursor position to the start of the field (issue 12359).
+        event.target.scrollLeft = 0;
         elementData.beforeInputSelectionRange = null;
       };
 

@@ -41,7 +41,9 @@ import { AnnotationLayerBuilder } from "./annotation_layer_builder.js";
 import { NullL10n } from "./l10n_utils.js";
 import { PDFPageView } from "./pdf_page_view.js";
 import { SimpleLinkService } from "./pdf_link_service.js";
+import { StructTreeLayerBuilder } from "./struct_tree_layer_builder.js";
 import { TextLayerBuilder } from "./text_layer_builder.js";
+import { XfaLayerBuilder } from "./xfa_layer_builder.js";
 
 const DEFAULT_CACHE_SIZE = 10;
 
@@ -387,6 +389,11 @@ class BaseViewer {
     if (!this.pdfDocument) {
       return;
     }
+    // Normalize the rotation, by clamping it to the [0, 360) range.
+    rotation %= 360;
+    if (rotation < 0) {
+      rotation += 360;
+    }
     if (this._pagesRotation === rotation) {
       return; // The rotation didn't change.
     }
@@ -478,6 +485,7 @@ class BaseViewer {
     if (!pdfDocument) {
       return;
     }
+    const isPureXfa = pdfDocument.isPureXfa;
     const pagesCount = pdfDocument.numPages;
     const firstPagePromise = pdfDocument.getPage(1);
     // Rendering (potentially) depends on this, hence fetching it immediately.
@@ -523,6 +531,7 @@ class BaseViewer {
         const viewport = firstPdfPage.getViewport({ scale: scale * CSS_UNITS });
         const textLayerFactory =
           this.textLayerMode !== TextLayerMode.DISABLE ? this : null;
+        const xfaLayerFactory = isPureXfa ? this : null;
 
         for (let pageNum = 1; pageNum <= pagesCount; ++pageNum) {
           const pageView = new PDFPageView({
@@ -536,6 +545,8 @@ class BaseViewer {
             textLayerFactory,
             textLayerMode: this.textLayerMode,
             annotationLayerFactory: this,
+            xfaLayerFactory,
+            structTreeLayerFactory: this,
             imageResourcesPath: this.imageResourcesPath,
             renderInteractiveForms: this.renderInteractiveForms,
             renderer: this.renderer,
@@ -543,7 +554,6 @@ class BaseViewer {
             useOnlyCssZoom: this.useOnlyCssZoom,
             maxCanvasPixels: this.maxCanvasPixels,
             l10n: this.l10n,
-            enableScripting: this.enableScripting,
           });
           this._pages.push(pageView);
         }
@@ -1287,7 +1297,7 @@ class BaseViewer {
     imageResourcesPath = "",
     renderInteractiveForms = false,
     l10n = NullL10n,
-    enableScripting = false,
+    enableScripting = null,
     hasJSActionsPromise = null,
     mouseState = null
   ) {
@@ -1301,10 +1311,32 @@ class BaseViewer {
       linkService: this.linkService,
       downloadManager: this.downloadManager,
       l10n,
-      enableScripting,
+      enableScripting: enableScripting ?? this.enableScripting,
       hasJSActionsPromise:
         hasJSActionsPromise || this.pdfDocument?.hasJSActions(),
       mouseState: mouseState || this._scriptingManager?.mouseState,
+    });
+  }
+
+  /**
+   * @param {HTMLDivElement} pageDiv
+   * @param {PDFPage} pdfPage
+   * @returns {XfaLayerBuilder}
+   */
+  createXfaLayerBuilder(pageDiv, pdfPage) {
+    return new XfaLayerBuilder({
+      pageDiv,
+      pdfPage,
+    });
+  }
+
+  /**
+   * @param {PDFPage} pdfPage
+   * @returns {StructTreeLayerBuilder}
+   */
+  createStructTreeLayerBuilder(pdfPage) {
+    return new StructTreeLayerBuilder({
+      pdfPage,
     });
   }
 
@@ -1331,25 +1363,21 @@ class BaseViewer {
    * @returns {Array} Array of objects with width/height/rotation fields.
    */
   getPagesOverview() {
-    const pagesOverview = this._pages.map(function (pageView) {
+    return this._pages.map(pageView => {
       const viewport = pageView.pdfPage.getViewport({ scale: 1 });
-      return {
-        width: viewport.width,
-        height: viewport.height,
-        rotation: viewport.rotation,
-      };
-    });
-    if (!this.enablePrintAutoRotate) {
-      return pagesOverview;
-    }
-    return pagesOverview.map(function (size) {
-      if (isPortraitOrientation(size)) {
-        return size;
+
+      if (!this.enablePrintAutoRotate || isPortraitOrientation(viewport)) {
+        return {
+          width: viewport.width,
+          height: viewport.height,
+          rotation: viewport.rotation,
+        };
       }
+      // Landscape orientation.
       return {
-        width: size.height,
-        height: size.width,
-        rotation: (size.rotation + 90) % 360,
+        width: viewport.height,
+        height: viewport.width,
+        rotation: (viewport.rotation - 90) % 360,
       };
     });
   }

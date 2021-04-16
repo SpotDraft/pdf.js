@@ -794,12 +794,8 @@ class PartialEvaluator {
     state,
     fallbackFontDict = null
   ) {
-    // TODO(mack): Not needed?
-    var fontName;
-    if (fontArgs) {
-      fontArgs = fontArgs.slice();
-      fontName = fontArgs[0].name;
-    }
+    const fontName =
+      fontArgs && fontArgs[0] instanceof Name ? fontArgs[0].name : null;
 
     return this.loadFont(fontName, fontRef, resources, fallbackFontDict)
       .then(translated => {
@@ -1310,6 +1306,43 @@ class PartialEvaluator {
     throw new FormatError(`Unknown PatternName: ${patternName}`);
   }
 
+  _parseVisibilityExpression(array, nestingCounter, currentResult) {
+    const MAX_NESTING = 10;
+    if (++nestingCounter > MAX_NESTING) {
+      warn("Visibility expression is too deeply nested");
+      return;
+    }
+    const length = array.length;
+    const operator = this.xref.fetchIfRef(array[0]);
+    if (length < 2 || !isName(operator)) {
+      warn("Invalid visibility expression");
+      return;
+    }
+    switch (operator.name) {
+      case "And":
+      case "Or":
+      case "Not":
+        currentResult.push(operator.name);
+        break;
+      default:
+        warn(`Invalid operator ${operator.name} in visibility expression`);
+        return;
+    }
+    for (let i = 1; i < length; i++) {
+      const raw = array[i];
+      const object = this.xref.fetchIfRef(raw);
+      if (Array.isArray(object)) {
+        const nestedResult = [];
+        currentResult.push(nestedResult);
+        // Recursively parse a subarray.
+        this._parseVisibilityExpression(object, nestingCounter, nestedResult);
+      } else if (isRef(raw)) {
+        // Reference to an OCG dictionary.
+        currentResult.push(raw.toString());
+      }
+    }
+  }
+
   async parseMarkedContentProps(contentProperties, resources) {
     let optionalContent;
     if (isName(contentProperties)) {
@@ -1328,6 +1361,18 @@ class PartialEvaluator {
         id: optionalContent.objId,
       };
     } else if (optionalContentType === "OCMD") {
+      const expression = optionalContent.get("VE");
+      if (Array.isArray(expression)) {
+        const result = [];
+        this._parseVisibilityExpression(expression, 0, result);
+        if (result.length > 0) {
+          return {
+            type: "OCMD",
+            expression: result,
+          };
+        }
+      }
+
       const optionalContentGroups = optionalContent.get("OCGs");
       if (
         Array.isArray(optionalContentGroups) ||
@@ -1343,19 +1388,13 @@ class PartialEvaluator {
           groupIds.push(optionalContentGroups.objId);
         }
 
-        let expression = null;
-        if (optionalContent.get("VE")) {
-          // TODO support visibility expression.
-          expression = true;
-        }
-
         return {
           type: optionalContentType,
           ids: groupIds,
           policy: isName(optionalContent.get("P"))
             ? optionalContent.get("P").name
             : null,
-          expression,
+          expression: null,
         };
       } else if (isRef(optionalContentGroups)) {
         return {
@@ -1917,7 +1956,10 @@ class PartialEvaluator {
               return;
             }
             // Other marked content types aren't supported yet.
-            args = [args[0].name];
+            args = [
+              args[0].name,
+              args[1] instanceof Dict ? args[1].get("MCID") : null,
+            ];
 
             break;
           case OPS.beginMarkedContent:
@@ -1977,8 +2019,9 @@ class PartialEvaluator {
     stateManager = null,
     normalizeWhitespace = false,
     combineTextItems = false,
+    includeMarkedContent = false,
     sink,
-    seenStyles = Object.create(null),
+    seenStyles = new Set(),
   }) {
     // Ensure that `resources`/`stateManager` is correctly initialized,
     // even if the provided parameter is e.g. `null`.
@@ -2028,17 +2071,19 @@ class PartialEvaluator {
       if (textContentItem.initialized) {
         return textContentItem;
       }
-      var font = textState.font;
-      if (!(font.loadedName in seenStyles)) {
-        seenStyles[font.loadedName] = true;
-        textContent.styles[font.loadedName] = {
+      const font = textState.font,
+        loadedName = font.loadedName;
+      if (!seenStyles.has(loadedName)) {
+        seenStyles.add(loadedName);
+
+        textContent.styles[loadedName] = {
           fontFamily: font.fallbackName,
           ascent: font.ascent,
           descent: font.descent,
           vertical: font.vertical,
         };
       }
-      textContentItem.fontName = font.loadedName;
+      textContentItem.fontName = loadedName;
 
       // 9.4.4 Text Space Details
       var tsm = [
@@ -2575,6 +2620,7 @@ class PartialEvaluator {
                     stateManager: xObjStateManager,
                     normalizeWhitespace,
                     combineTextItems,
+                    includeMarkedContent,
                     sink: sinkWrapper,
                     seenStyles,
                   })
@@ -2652,6 +2698,38 @@ class PartialEvaluator {
               })
             );
             return;
+          case OPS.beginMarkedContent:
+            if (includeMarkedContent) {
+              textContent.items.push({
+                type: "beginMarkedContent",
+                tag: isName(args[0]) ? args[0].name : null,
+              });
+            }
+            break;
+          case OPS.beginMarkedContentProps:
+            if (includeMarkedContent) {
+              flushTextContentItem();
+              let mcid = null;
+              if (isDict(args[1])) {
+                mcid = args[1].get("MCID");
+              }
+              textContent.items.push({
+                type: "beginMarkedContentProps",
+                id: Number.isInteger(mcid)
+                  ? `${self.idFactory.getPageObjId()}_mcid${mcid}`
+                  : null,
+                tag: isName(args[0]) ? args[0].name : null,
+              });
+            }
+            break;
+          case OPS.endMarkedContent:
+            if (includeMarkedContent) {
+              flushTextContentItem();
+              textContent.items.push({
+                type: "endMarkedContent",
+              });
+            }
+            break;
         } // switch
         if (textContent.items.length >= sink.desiredSize) {
           // Wait for ready, if we reach highWaterMark.
